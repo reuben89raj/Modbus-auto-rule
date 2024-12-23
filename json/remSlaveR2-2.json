@@ -1,0 +1,10 @@
+{
+  "policy_name": "Remove Slave R2",
+  "rules": [
+    {
+      "action": "remove_device",
+      "Name": "R2"
+    }
+  ]
+}
+

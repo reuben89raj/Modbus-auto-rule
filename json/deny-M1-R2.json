@@ -1,0 +1,6 @@
+{
+    "policy_name": "Deny Specific",
+    "rules": [
+        { "master_node": "M1", "slave_node": "R2", "action": "deny" }
+    ]
+}

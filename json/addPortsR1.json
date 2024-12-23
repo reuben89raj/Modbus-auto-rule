@@ -1,1 +1,11 @@
+{
+  "policy_name": "Add Ports to R1",
+  "rules": [
+    {
+      "action": "add_ports",
+      "Name": "R1",
+      "Ports": ["504", "505"]
+    }
+  ]
+}
 

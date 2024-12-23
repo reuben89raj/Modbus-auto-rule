@@ -1,0 +1,6 @@
+{
+    "policy_name": "Allow Specific M1-R2",
+    "rules": [
+        { "master_node": "M1", "slave_node": "R2", "action": "allow" }
+    ]
+}

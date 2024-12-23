@@ -1,0 +1,15 @@
+{
+  "policy_name": "Add New Slave R3",
+  "rules": [
+    {
+      "action": "add_device",
+      "Type": "Slave",
+      "IP": "10.0.2.3",
+      "Name": "R3",
+      "PortFunctionMap": {
+        "502": [1, 4],
+        "503": [8, 15]
+      }
+    }
+  ]
+}

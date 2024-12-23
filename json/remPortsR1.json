@@ -1,0 +1,11 @@
+{
+  "policy_name": "Remove Ports from R1",
+  "rules": [
+    {
+      "action": "remove_ports",
+      "Name": "R1",
+      "Ports": ["503", "505"]
+    }
+  ]
+}
+
