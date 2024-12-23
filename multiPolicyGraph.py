@@ -1,6 +1,7 @@
 import json
 import os
 import readline
+import time
 
 def complete_json_files(text, state):
     # Get a list of all files in the current directory
