@@ -3,7 +3,7 @@ import os
 import readline
 
 def complete_json_files(text, state):
-    files = os.listdir(".")
+    files = os.listdir("./json")
     matches = [f for f in files if f.startswith(text) and f.endswith(".json")]
     return matches[state] if state < len(matches) else None
 
@@ -101,14 +101,16 @@ def listen_and_update_graph(device_config, initial_policy):
     while True:
         construct_and_print_graph(device_config, policy_rules)
 
-        user_input = input("Enter policy JSON file name or type 'exit' to quit:\n")
-        if user_input.strip().lower() == "exit":
+        user_input = input("Enter policy JSON file name or type 'exit' to quit:\n").strip()
+        if user_input.lower() == "exit":
             print("Exiting...")
             break
 
+        user_input = f"./json/{user_input}"
         try:
-            with open(user_input.strip(), "r") as file:
+            with open(user_input, "r") as file:
                 new_policy = json.load(file)
+                print(f"Applying policy: {new_policy}")
                 apply_device_modifications(device_config, new_policy)
                 policy_rules.append(new_policy)
         except (json.JSONDecodeError, FileNotFoundError) as e:

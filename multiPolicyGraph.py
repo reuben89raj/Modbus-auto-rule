@@ -5,7 +5,7 @@ import time
 
 def complete_json_files(text, state):
     # Get a list of all files in the current directory
-    files = os.listdir(".")
+    files = os.listdir("./json")
     # Filter files based on the text and ensure they end with .json
     matches = [f for f in files if f.startswith(text) and f.endswith(".json")]
     # Return the state-th match or None if out of bounds
@@ -108,23 +108,31 @@ def construct_and_print_graph(device_config, policy_json):
         for rule in policy.get("rules", []):
             action = rule.get("action", "").lower()
             if action in ["allow", "deny"]:
-                master = rule["master_node"]
-                slave = rule["slave_node"]
+                master = rule.get("master_node")
+                slave = rule.get("slave_node")
+
+                if not master or not slave:
+                    print(f"Invalid rule: {rule}. Missing 'master_node' or 'slave_node'.")
+                    continue
 
                 # Handle "all" for masters or slaves
-                master_targets = master_nodes if master == "all" else [master]
-                slave_targets = slave_nodes if slave == "all" else [slave]
+                master_targets = master_nodes if master.lower() == "all" else [master]
+                slave_targets = slave_nodes if slave.lower() == "all" else [slave]
 
                 if action == "allow":
                     # Ensure edges exist
                     for m in master_targets:
                         if m in graph:
                             graph[m].update(slave_targets)
+                        else:
+                            print(f"Master node '{m}' not found in graph.")
                 elif action == "deny":
                     # Remove edges
                     for m in master_targets:
                         if m in graph:
                             graph[m] = graph[m] - set(slave_targets)
+                        else:
+                            print(f"Master node '{m}' not found in graph.")
 
     # Print the graph
     print("\nNetwork Graph:")
@@ -140,17 +148,16 @@ def listen_and_update_graph(device_config, initial_policy):
         construct_and_print_graph(device_config, policy_rules)
 
         # Listen for user input
-        user_input = input("Enter policy JSON file name or type 'exit' to quit:\n")
-        if user_input.strip().lower() == "exit":
+        user_input = input("Enter policy JSON file name or type 'exit' to quit:\n").strip()
+        if user_input.lower() == "exit":
             print("Exiting...")
             break
 
+        user_input = f"./json/{user_input}"
         try:
-            with open(user_input.strip(), "r") as file:
+            with open(user_input, "r") as file:
                 new_policy = json.load(file)
-                # First, apply device modifications if any
                 apply_device_modifications(device_config, new_policy)
-                # Then add the new policy
                 policy_rules.append(new_policy)
         except (json.JSONDecodeError, FileNotFoundError) as e:
             print(f"Error loading JSON file: {e}. Please try again.")
