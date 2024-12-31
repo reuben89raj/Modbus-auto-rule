@@ -18,7 +18,8 @@ SDE_PYTHON3   = os.path.join(SDE_INSTALL, 'lib', 'python' + PYTHON3_VER,
 sys.path.append(SDE_PYTHON3)
 sys.path.append(os.path.join(SDE_PYTHON3, 'tofino'))
 sys.path.append(os.path.join(SDE_PYTHON3, 'tofino', 'bfrt_grpc'))
-import bfrt_grpc.client as gc
+
+import bfrt_grpc.client as gc  # type ignore
 
 # Utility Functions
 def ip_to_int(ip_str):
@@ -60,123 +61,131 @@ flow_table = bfrt_info.table_get("SwitchIngress.flowout")
 flow_table.info.key_field_annotation_add("hdr.ipv4.dstAddr", "ipv4")
 flow_table.info.key_field_annotation_add("hdr.ipv4.srcAddr", "ipv4")
 
-# Global Set to Track Applied Keys
-applied_table_keys = set()
+# Graph-to-Table Mapping
+graph_to_table = {}
 
 # Graph Representation
-def construct_and_print_graph(device_config):
-    """Construct and print the network graph."""
+def construct_graph(device_config, policies):
+    """Construct the graph based on device config and policies."""
     graph = {}
-    devices = device_config["Devices"]
+    masters = [dev["Name"] for dev in device_config["Devices"] if dev["Type"].lower() == "master"]
+    slaves = [dev for dev in device_config["Devices"] if dev["Type"].lower() == "slave"]
 
-    for device in devices:
-        if device["Type"].lower() == "master":
-            graph[device["Name"]] = {"Slaves": []}
-        elif device["Type"].lower() == "slave":
-            graph[device["Name"]] = {"ListeningPorts": device.get("ListeningPorts", [])}
+    for master in masters:
+        graph[master] = [slave["Name"] for slave in slaves]
 
-    print("\nNetwork Graph:")
-    for node, connections in graph.items():
-        print(f"{node}: {connections}")
-    print()
+    for slave in slaves:
+        graph[slave["Name"]] = slave.get("ListeningPorts", [])
 
-# Apply Device Modifications
-def apply_device_modifications(device_config, data):
-    devices = device_config["Devices"]
-
-    for rule in data.get("rules", []):
-        action = rule.get("action", "").lower()
-
-        if action == "add_device":
-            new_dev = {
-                "Type": rule["Type"],
-                "IP": rule["IP"],
-                "Name": rule["Name"]
-            }
-            if "ListeningPorts" in rule and rule["Type"].lower() == "slave":
-                new_dev["ListeningPorts"] = rule["ListeningPorts"]
-            devices.append(new_dev)
-            print(new_dev)
-
-        elif action == "remove_device":
-            dev_name = rule["Name"]
-            device_config["Devices"] = [d for d in devices if d["Name"] != dev_name]
-
-        elif action == "add_ports":
-            dev_name = rule["Name"]
-            new_ports = rule.get("Ports", [])
-            for d in devices:
-                if d["Name"] == dev_name and d["Type"].lower() == "slave":
-                    if "ListeningPorts" not in d:
-                        d["ListeningPorts"] = []
-                    d["ListeningPorts"].extend([p for p in new_ports if p not in d["ListeningPorts"]])
-
-        elif action == "remove_ports":
-            dev_name = rule["Name"]
-            remove_ports = rule.get("Ports", [])
-            for d in devices:
-                if d["Name"] == dev_name and d["Type"].lower() == "slave":
-                    d["ListeningPorts"] = [p for p in d["ListeningPorts"] if p not in remove_ports]
-
-# Construct and Apply Policy Rules
-def construct_and_apply_rules(device_config, policies):
-    devices = device_config["Devices"]
-    masters = [dev for dev in devices if dev["Type"].lower() == "master"]
-    slaves = [dev for dev in devices if dev["Type"].lower() == "slave"]
-
+    # Apply policies to refine the graph
     for policy in policies:
         for rule in policy.get("rules", []):
             master_node = rule.get("master_node", "all")
             slave_node = rule.get("slave_node", "all")
             action = rule.get("action", "").lower()
 
-            if action in ["allow", "deny"]:
-                for master in masters if master_node == "all" else [m for m in masters if m["Name"] == master_node]:
-                    for slave in slaves if slave_node == "all" else [s for s in slaves if s["Name"] == slave_node]:
-                        for port in slave.get("ListeningPorts", []):
-                            match_fields = {
-                                "hdr.ipv4.dstAddr": ip_to_int(slave["IP"]),
-                                "hdr.ipv4.srcAddr": ip_to_int(master["IP"]),
-                                "hdr.ipv4.protocol": 6,  # TCP
-                                "hdr.tcp.dstPort": int(port)
-                            }
+            masters = [master for master in graph.keys() if master == master_node or master_node == "all"]
+            slaves = [slave for slave in graph if slave in graph and (slave == slave_node or slave_node == "all")]
 
-                            # Avoid re-adding existing rules
-                            key_tuple = tuple(match_fields.items())
-                            if action == "allow" and key_tuple in applied_table_keys:
-                                continue
+            if action == "deny":
+                for master in masters:
+                    graph[master] = [slave for slave in graph[master] if slave not in slaves]
 
-                            try:
-                                table_key = flow_table.make_key([
-                                    gc.KeyTuple(k, v) for k, v in match_fields.items()
-                                ])
+    return graph
 
-                                if action == "allow":
-                                    table_action = flow_table.make_data([], "SwitchIngress.nop")
-                                    flow_table.entry_add(dev_tgt, [table_key], [table_action])
-                                    applied_table_keys.add(key_tuple)
-                                    print(f"Rule added: src: {master['IP']}, dst: {slave['IP']}, port: {port}")
+def apply_table_entries(graph, device_config, policies):
+    """Install flow rules based on the graph."""
+    global graph_to_table
 
-                                elif action == "deny":
-                                    flow_table.entry_del(dev_tgt, [table_key])
-                                    applied_table_keys.discard(key_tuple)
-                                    print(f"Rule denied: src: {master['IP']}, dst: {slave['IP']}, port: {port}")
+    for master, slaves in graph.items():
+        for slave_name in slaves:
+            slave = next((d for d in device_config["Devices"] if d["Name"] == slave_name), None)
+            if not slave:
+                continue
 
-                            except Exception as e:
-                                print(f"Error applying rule: {rule}. Error: {e}")
+            for port in slave.get("ListeningPorts", []):
+                match_fields = {
+                    "hdr.ipv4.srcAddr": ip_to_int(next((d["IP"] for d in device_config["Devices"] if d["Name"] == master), None)),
+                    "hdr.ipv4.dstAddr": ip_to_int(slave["IP"]),
+                    "hdr.ipv4.protocol": 6,
+                    "hdr.tcp.dstPort": int(port)
+                }
+                key_tuple = tuple(match_fields.items())
 
-# Update Policy
-def update_policy(policy):
-    construct_and_apply_rules(device_config, [policy])
+                if key_tuple not in graph_to_table:
+                    try:
+                        table_key = flow_table.make_key([
+                            gc.KeyTuple(k, v) for k, v in match_fields.items()
+                        ])
+                        table_action = flow_table.make_data([], "SwitchIngress.nop")
+                        flow_table.entry_add(dev_tgt, [table_key], [table_action])
+                        graph_to_table[key_tuple] = table_key
+                        print(f"Rule added: src: {master}, dst: {slave['Name']}, port: {port}")
+                    except Exception as e:
+                        print(f"Error adding rule for {master}->{slave['Name']} on port {port}: {e}")
 
-# Main Loop for Listening and Updating
-def listen_and_update_graph(device_config, initial_policy):
-    # Install initial table entries
-    construct_and_apply_rules(device_config, [initial_policy])
-    construct_and_print_graph(device_config)
+def remove_table_entries(graph, previous_graph, device_config):
+    """Remove outdated flow rules."""
+    global graph_to_table
+
+    for master, previous_slaves in previous_graph.items():
+        current_slaves = graph.get(master, [])
+        for slave_name in previous_slaves:
+            # If the slave is not in the current graph, remove its table entries
+            if slave_name not in current_slaves:
+                slave_device = next((d for d in device_config["Devices"] if d["Name"] == slave_name), None)
+                if not slave_device:
+                    print(f"Device {slave_name} no longer exists. Skipping table removal.")
+                    continue
+
+                for port in slave_device.get("ListeningPorts", []):
+                    match_fields = {
+                        "hdr.ipv4.srcAddr": ip_to_int(next((d["IP"] for d in device_config["Devices"] if d["Name"] == master), None)),
+                        "hdr.ipv4.dstAddr": ip_to_int(slave_device["IP"]),
+                        "hdr.ipv4.protocol": 6,
+                        "hdr.tcp.dstPort": int(port)
+                    }
+                    key_tuple = tuple(match_fields.items())
+                    if key_tuple in graph_to_table:
+                        try:
+                            flow_table.entry_del(dev_tgt, [graph_to_table[key_tuple]])
+                            del graph_to_table[key_tuple]
+                            print(f"Rule removed: src: {master}, dst: {slave_name}, port: {port}")
+                        except Exception as e:
+                            print(f"Error removing rule: {e}")
+
+def update_device_config(device_config, new_config):
+    """Update the device configuration based on the action."""
+    for new_device in new_config.get("Devices", []):
+        action = new_device.get("action")
+
+        if action == "add_device":
+            # Avoid duplicates
+            if not any(dev["Name"] == new_device["Name"] for dev in device_config["Devices"]):
+                device_config["Devices"].append(new_device)
+                print(f"Device added: {new_device}")
+            else:
+                print(f"Device {new_device['Name']} already exists. Skipping addition.")
+
+        elif action == "remove_device":
+            # Remove the device by name
+            device_config["Devices"] = [dev for dev in device_config["Devices"] if dev["Name"] != new_device["Name"]]
+            print(f"Device removed: {new_device['Name']}")
+
+
+def update_policy(policies, new_policy):
+    """Update the policy list."""
+    policies.append(new_policy)
+
+# Main Listener
+def listen_and_update(device_config, policies):
+    """Listen for updates and maintain the network graph."""
+    graph = construct_graph(device_config, policies)
+    apply_table_entries(graph, device_config, policies)
+    print_graph(graph)
 
     while True:
-        user_input = input("Enter device config or policy JSON file name, or type 'exit':\n")
+        user_input = input("Enter JSON file name for device config or policy update, or type 'exit':\n")
         if user_input.strip().lower() == "exit":
             print("Exiting...")
             break
@@ -185,18 +194,35 @@ def listen_and_update_graph(device_config, initial_policy):
             with open(user_input.strip(), "r") as file:
                 data = json.load(file)
 
-            if "master_node" in data.get("rules", [{}][0]):
-                print("\nApplying policy update...")
-                update_policy(data)
-            elif "action" in data.get("rules", [{}][0]):
-                print("\nApplying device configuration update...")
-                apply_device_modifications(device_config, data)
-                construct_and_apply_rules(device_config, [initial_policy])
+            if "device_config_name" in data:
+                print("\nUpdating device configuration...")
+                update_device_config(device_config, data)
+            elif "policy_name" in data:
+                print("\nUpdating policy...")
+                update_policy(policies, data)
 
-            construct_and_print_graph(device_config)
+            # Reconstruct the graph after applying the changes
+            previous_graph = graph
+            graph = construct_graph(device_config, policies)
+
+            # Remove stale table entries based on the updated graph
+            remove_table_entries(graph, previous_graph, device_config)
+
+            # Add new table entries based on the updated graph
+            apply_table_entries(graph, device_config, policies)
+
+            # Print the updated graph
+            print_graph(graph)
 
         except (json.JSONDecodeError, FileNotFoundError) as e:
             print(f"Error loading JSON file: {e}. Please try again.")
+
+
+def print_graph(graph):
+    """Print the current graph."""
+    print("\nNetwork Graph:")
+    for master, slaves in graph.items():
+        print(f"{master}: {', '.join(slaves)}")
 
 # Example Configurations
 device_config_json = """{
@@ -216,6 +242,6 @@ initial_policy_json = """{
 }"""
 
 device_config = json.loads(device_config_json)
-initial_policy = json.loads(initial_policy_json)
-construct_and_print_graph(device_config)
-listen_and_update_graph(device_config, initial_policy)
+policies = [json.loads(initial_policy_json)]
+
+listen_and_update(device_config, policies)
