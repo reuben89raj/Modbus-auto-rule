@@ -5,21 +5,21 @@ import json
 import struct
 import readline
 
-SDE_INSTALL   = os.environ['SDE_INSTALL']
-SDE_PYTHON2   = os.path.join(SDE_INSTALL, 'lib', 'python2.7', 'site-packages')
+SDE_INSTALL = os.environ['SDE_INSTALL']
+SDE_PYTHON2 = os.path.join(SDE_INSTALL, 'lib', 'python2.7', 'site-packages')
 sys.path.append(SDE_PYTHON2)
 sys.path.append(os.path.join(SDE_PYTHON2, 'tofino'))
 
-PYTHON3_VER   = '{}.{}'.format(
+PYTHON3_VER = '{}.{}'.format(
     sys.version_info.major,
     sys.version_info.minor)
-SDE_PYTHON3   = os.path.join(SDE_INSTALL, 'lib', 'python' + PYTHON3_VER,
-                             'site-packages')
+SDE_PYTHON3 = os.path.join(SDE_INSTALL, 'lib', 'python' + PYTHON3_VER,
+                           'site-packages')
 sys.path.append(SDE_PYTHON3)
 sys.path.append(os.path.join(SDE_PYTHON3, 'tofino'))
 sys.path.append(os.path.join(SDE_PYTHON3, 'tofino', 'bfrt_grpc'))
 
-import bfrt_grpc.client as gc  # type ignore
+import bfrt_grpc.client as gc  # type: ignore
 
 # Utility Functions
 def ip_to_int(ip_str):
@@ -93,10 +93,29 @@ def construct_graph(device_config, policies):
 
     return graph
 
-def apply_table_entries(graph, device_config, policies):
-    """Install flow rules based on the graph."""
+def apply_table_entries(graph, device_config, policies, removed_devices=None):
+    """Install flow rules based on the graph and remove entries for removed devices."""
     global graph_to_table
 
+    if removed_devices is None:
+        removed_devices = []
+
+    # Remove table entries for removed devices
+    for removed_device in removed_devices:
+        for key_tuple, table_key in list(graph_to_table.items()):
+            src_ip, dst_ip = key_tuple[0][1], key_tuple[1][1]
+            src_device = next((d for d in device_config["Devices"] if ip_to_int(d["IP"]) == src_ip), None)
+            dst_device = next((d for d in device_config["Devices"] if ip_to_int(d["IP"]) == dst_ip), None)
+
+            if (src_device and src_device["Name"] == removed_device) or (dst_device and dst_device["Name"] == removed_device):
+                try:
+                    flow_table.entry_del(dev_tgt, [table_key])
+                    del graph_to_table[key_tuple]
+                    print(f"Rule removed: src: {src_device['Name'] if src_device else 'unknown'}, dst: {dst_device['Name'] if dst_device else 'unknown'}")
+                except Exception as e:
+                    print(f"Error removing rule for {src_device['Name'] if src_device else 'unknown'}->{dst_device['Name'] if dst_device else 'unknown'}: {e}")
+
+    # Add new table entries based on the graph
     for master, slaves in graph.items():
         for slave_name in slaves:
             slave = next((d for d in device_config["Devices"] if d["Name"] == slave_name), None)
@@ -196,22 +215,18 @@ def listen_and_update(device_config, policies):
 
             if "device_config_name" in data:
                 print("\nUpdating device configuration...")
+                previous_graph = graph
                 update_device_config(device_config, data)
+                graph = construct_graph(device_config, policies)
+                remove_table_entries(graph, previous_graph, device_config)
             elif "policy_name" in data:
                 print("\nUpdating policy...")
                 update_policy(policies, data)
+                previous_graph = graph
+                graph = construct_graph(device_config, policies)
+                remove_table_entries(graph, previous_graph, device_config)
 
-            # Reconstruct the graph after applying the changes
-            previous_graph = graph
-            graph = construct_graph(device_config, policies)
-
-            # Remove stale table entries based on the updated graph
-            remove_table_entries(graph, previous_graph, device_config)
-
-            # Add new table entries based on the updated graph
             apply_table_entries(graph, device_config, policies)
-
-            # Print the updated graph
             print_graph(graph)
 
         except (json.JSONDecodeError, FileNotFoundError) as e:
