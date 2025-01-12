@@ -5,19 +5,17 @@ import json
 import struct
 import readline
 
+# Paths for Python libraries
 SDE_INSTALL = os.environ['SDE_INSTALL']
-SDE_PYTHON2 = os.path.join(SDE_INSTALL, 'lib', 'python2.7', 'site-packages')
-sys.path.append(SDE_PYTHON2)
-sys.path.append(os.path.join(SDE_PYTHON2, 'tofino'))
+PYTHON3_VER = '{}.{}'.format(sys.version_info.major, sys.version_info.minor)
 
-PYTHON3_VER = '{}.{}'.format(
-    sys.version_info.major,
-    sys.version_info.minor)
-SDE_PYTHON3 = os.path.join(SDE_INSTALL, 'lib', 'python' + PYTHON3_VER,
-                           'site-packages')
-sys.path.append(SDE_PYTHON3)
-sys.path.append(os.path.join(SDE_PYTHON3, 'tofino'))
-sys.path.append(os.path.join(SDE_PYTHON3, 'tofino', 'bfrt_grpc'))
+sys.path.extend([
+    os.path.join(SDE_INSTALL, 'lib', 'python2.7', 'site-packages'),
+    os.path.join(SDE_INSTALL, 'lib', 'python2.7', 'site-packages', 'tofino'),
+    os.path.join(SDE_INSTALL, 'lib', 'python' + PYTHON3_VER, 'site-packages'),
+    os.path.join(SDE_INSTALL, 'lib', 'python' + PYTHON3_VER, 'site-packages', 'tofino'),
+    os.path.join(SDE_INSTALL, 'lib', 'python' + PYTHON3_VER, 'site-packages', 'tofino', 'bfrt_grpc'),
+])
 
 import bfrt_grpc.client as gc  # type: ignore
 
@@ -93,29 +91,10 @@ def construct_graph(device_config, policies):
 
     return graph
 
-def apply_table_entries(graph, device_config, policies, removed_devices=None):
-    """Install flow rules based on the graph and remove entries for removed devices."""
+def apply_table_entries(graph, device_config, policies):
+    """Install flow rules based on the graph."""
     global graph_to_table
 
-    if removed_devices is None:
-        removed_devices = []
-
-    # Remove table entries for removed devices
-    for removed_device in removed_devices:
-        for key_tuple, table_key in list(graph_to_table.items()):
-            src_ip, dst_ip = key_tuple[0][1], key_tuple[1][1]
-            src_device = next((d for d in device_config["Devices"] if ip_to_int(d["IP"]) == src_ip), None)
-            dst_device = next((d for d in device_config["Devices"] if ip_to_int(d["IP"]) == dst_ip), None)
-
-            if (src_device and src_device["Name"] == removed_device) or (dst_device and dst_device["Name"] == removed_device):
-                try:
-                    flow_table.entry_del(dev_tgt, [table_key])
-                    del graph_to_table[key_tuple]
-                    print(f"Rule removed: src: {src_device['Name'] if src_device else 'unknown'}, dst: {dst_device['Name'] if dst_device else 'unknown'}")
-                except Exception as e:
-                    print(f"Error removing rule for {src_device['Name'] if src_device else 'unknown'}->{dst_device['Name'] if dst_device else 'unknown'}: {e}")
-
-    # Add new table entries based on the graph
     for master, slaves in graph.items():
         for slave_name in slaves:
             slave = next((d for d in device_config["Devices"] if d["Name"] == slave_name), None)
@@ -138,65 +117,75 @@ def apply_table_entries(graph, device_config, policies, removed_devices=None):
                         ])
                         table_action = flow_table.make_data([], "SwitchIngress.nop")
                         flow_table.entry_add(dev_tgt, [table_key], [table_action])
-                        graph_to_table[key_tuple] = table_key
+                        graph_to_table[key_tuple] = table_key  # Store the actual table_key
                         print(f"Rule added: src: {master}, dst: {slave['Name']}, port: {port}")
                     except Exception as e:
                         print(f"Error adding rule for {master}->{slave['Name']} on port {port}: {e}")
 
-def remove_table_entries(graph, previous_graph, device_config):
+
+def remove_table_entries(paths, device_config):
     """Remove outdated flow rules."""
     global graph_to_table
+    print(f"Paths to remove: {paths}")
+    print(f"Device Config: {device_config}")
+    for path in paths:
+        master, slave, port = path
+        slave_device = next((d for d in device_config["Devices"] if d["Name"] == slave), None)
+        master_device = next((d for d in device_config["Devices"] if d["Name"] == master), None)
+        print(f"slave_device = {slave_device} master_device = {master_device}")
+        if not slave_device or not master_device:
+            continue
 
-    for master, previous_slaves in previous_graph.items():
-        current_slaves = graph.get(master, [])
-        for slave_name in previous_slaves:
-            # If the slave is not in the current graph, remove its table entries
-            if slave_name not in current_slaves:
-                slave_device = next((d for d in device_config["Devices"] if d["Name"] == slave_name), None)
-                if not slave_device:
-                    print(f"Device {slave_name} no longer exists. Skipping table removal.")
-                    continue
+        match_fields = {
+            "hdr.ipv4.srcAddr": ip_to_int(master_device["IP"]),
+            "hdr.ipv4.dstAddr": ip_to_int(slave_device["IP"]),
+            "hdr.ipv4.protocol": 6,
+            "hdr.tcp.dstPort": int(port),
+        }
+        key_tuple = tuple(match_fields.items())
+        print(f"Key tuple for deletion: {key_tuple}")
+        
+        if key_tuple in graph_to_table:
+            try:
+                flow_table.entry_del(dev_tgt, [graph_to_table[key_tuple]])  # Use the stored table_key
+                del graph_to_table[key_tuple]
+                print(f"Rule removed: src: {master}, dst: {slave}, port: {port}")
+            except Exception as e:
+                print(f"Error removing rule: {e}")
 
-                for port in slave_device.get("ListeningPorts", []):
-                    match_fields = {
-                        "hdr.ipv4.srcAddr": ip_to_int(next((d["IP"] for d in device_config["Devices"] if d["Name"] == master), None)),
-                        "hdr.ipv4.dstAddr": ip_to_int(slave_device["IP"]),
-                        "hdr.ipv4.protocol": 6,
-                        "hdr.tcp.dstPort": int(port)
-                    }
-                    key_tuple = tuple(match_fields.items())
-                    if key_tuple in graph_to_table:
-                        try:
-                            flow_table.entry_del(dev_tgt, [graph_to_table[key_tuple]])
-                            del graph_to_table[key_tuple]
-                            print(f"Rule removed: src: {master}, dst: {slave_name}, port: {port}")
-                        except Exception as e:
-                            print(f"Error removing rule: {e}")
 
 def update_device_config(device_config, new_config):
     """Update the device configuration based on the action."""
-    for new_device in new_config.get("Devices", []):
-        action = new_device.get("action")
+    removed_devices = []  # Track devices removed from the configuration
+    action = new_config.get("action")
 
-        if action == "add_device":
+    if action == "add_device":
+        for device in new_config.get("Devices", []):
             # Avoid duplicates
-            if not any(dev["Name"] == new_device["Name"] for dev in device_config["Devices"]):
-                device_config["Devices"].append(new_device)
-                print(f"Device added: {new_device}")
+            if any(dev["Name"] == device["Name"] for dev in device_config["Devices"]):
+                print(f"Device {device['Name']} already exists. Skipping addition.")
             else:
-                print(f"Device {new_device['Name']} already exists. Skipping addition.")
+                device_config["Devices"].append(device)
+                print(f"Device added: {device['Name']}")
 
-        elif action == "remove_device":
-            # Remove the device by name
-            device_config["Devices"] = [dev for dev in device_config["Devices"] if dev["Name"] != new_device["Name"]]
-            print(f"Device removed: {new_device['Name']}")
+    elif action == "remove_device":
+        for device in new_config.get("Devices", []):
+            existing_device = next((d for d in device_config["Devices"] if d["Name"] == device["Name"]), None)
+            if existing_device:
+                device_config["Devices"] = [d for d in device_config["Devices"] if d["Name"] != device["Name"]]
+                removed_devices.append(device["Name"])
+                print(f"Device removed: {device['Name']}")
+            else:
+                print(f"Device {device['Name']} does not exist. Skipping removal.")
+
+    return removed_devices
 
 
 def update_policy(policies, new_policy):
     """Update the policy list."""
     policies.append(new_policy)
+    print(f"Policy updated: {new_policy['policy_name']}")
 
-# Main Listener
 def listen_and_update(device_config, policies):
     """Listen for updates and maintain the network graph."""
     graph = construct_graph(device_config, policies)
@@ -215,23 +204,42 @@ def listen_and_update(device_config, policies):
 
             if "device_config_name" in data:
                 print("\nUpdating device configuration...")
-                previous_graph = graph
-                update_device_config(device_config, data)
+                # Snapshot the current device configuration
+                previous_device_config = json.loads(json.dumps(device_config))  # Deep copy
+                previous_graph = construct_graph(previous_device_config, policies)
+
+                # Update the device configuration
+                removed_devices = update_device_config(device_config, data)
+
+                # Generate the updated graph after device config change
                 graph = construct_graph(device_config, policies)
-                remove_table_entries(graph, previous_graph, device_config)
+
+                # Remove table entries for paths involving removed devices
+                removed_paths = [
+                    (master, slave, port)
+                    for master, slaves in previous_graph.items()
+                    for slave in slaves
+                    for port in previous_graph.get(slave, [])
+                    if slave in removed_devices
+                ]
+                remove_table_entries(removed_paths, previous_device_config)
+
+                # Apply any new table entries
+                apply_table_entries(graph, device_config, policies)
+                print_graph(graph)
+
             elif "policy_name" in data:
                 print("\nUpdating policy...")
-                update_policy(policies, data)
                 previous_graph = graph
+                update_policy(policies, data)
                 graph = construct_graph(device_config, policies)
                 remove_table_entries(graph, previous_graph, device_config)
+                apply_table_entries(graph, device_config, policies)
 
-            apply_table_entries(graph, device_config, policies)
             print_graph(graph)
 
         except (json.JSONDecodeError, FileNotFoundError) as e:
             print(f"Error loading JSON file: {e}. Please try again.")
-
 
 def print_graph(graph):
     """Print the current graph."""
@@ -241,13 +249,15 @@ def print_graph(graph):
 
 # Example Configurations
 device_config_json = """{
+  "device_config_name": "Initial Configuration",
   "Devices": [
     { "Type": "Master", "IP": "10.0.1.1", "Name": "M1" },
     { "Type": "Master", "IP": "10.0.1.2", "Name": "M2" },
     { "Type": "Slave", "IP": "10.0.2.1", "ListeningPorts": ["502", "503"], "Name": "R1" },
     { "Type": "Slave", "IP": "10.0.2.2", "ListeningPorts": ["502", "503"], "Name": "R2" }
   ]
-}"""
+}
+"""
 
 initial_policy_json = """{
   "policy_name": "Default Allow All",
